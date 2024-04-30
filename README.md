@@ -1,3 +1,10 @@
+> **Note**
+> This is an unmaintained fork of https://github.com/karpathy/llm.c that updates the CUDA implementation to demonstrate features and best practices of the [CUDA C++ Core Libraries](https://github.com/NVIDIA/cccl).
+> This work was presented as a lecture to the [CUDA MODE](https://github.com/cuda-mode) group.
+> The recording is available on [YouTube](https://www.youtube.com/watch?v=WiB_3Csfj_Q).
+> The slides are available [here](https://drive.google.com/drive/folders/1T-t0d_u0Xu8w_-1E5kAwmXNfF72x-HTA).
+> This fork is primarily for demonstration purposes only and there are currently no plans to keep this fork up-to-date with the upstream llm.c project.
+
 # llm.c
 
 LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. Training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in the single file [train_gpt2.c](train_gpt2.c), and training it on GPU is ~2,000 lines (adds CUDA kernels) in [train_gpt2.cu](train_gpt2.cu). The code compiles and runs instantly, it exactly matches the PyTorch reference implementation, and it ~matches the speed of (compiled) PyTorch (fp32, no flash attention). I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
