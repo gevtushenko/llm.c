@@ -11,10 +11,15 @@ sure that those parts work out ok and that we do a += as necessary. E.g.,
 the layernorms are connected to the residuals so we += in layernorm backward.
 */
 
+#include <cub/thread/thread_store.cuh>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <math.h>
+#include <thrust/detail/raw_pointer_cast.h>
+#include <thrust/device_ptr.h>
+#include <thrust/iterator/permutation_iterator.h>
+#include <thrust/scatter.h>
 #include <time.h>
 #include <assert.h>
 #include <float.h>
@@ -26,6 +31,26 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+#include <memory>
+#include <chrono>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <cub/device/device_for.cuh>
+#include <cub/iterator/cache_modified_input_iterator.cuh>
+#include <cub/iterator/cache_modified_output_iterator.cuh>
+#include <cuda/std/mdspan>
+#include <cuda/atomic>
+
+template <class T>
+using pinned_vector = thrust::host_vector<
+    T, thrust::mr::stateless_resource_allocator<
+           T, thrust::system::cuda::universal_host_pinned_memory_resource>>;
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -137,43 +162,6 @@ void *malloc_check(size_t size, const char *file, int line) {
 // ----------------------------------------------------------------------------
 // all the kernels
 
-// warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
-// warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
-__global__ void encoder_forward_kernel2(float* out,
-                               int* inp, float* wte, float* wpe,
-                               int B, int T, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-
-    if (idx < N) {
-        int bt = idx / C;
-        int b = bt / T;
-        int t = bt % T;
-        int c = idx % C;
-
-        int ix = inp[b * T + t];
-
-        float* out_btc = out + b * T * C + t * C + c;
-        float* wte_ix = wte + ix * C + c;
-        float* wpe_tc = wpe + t * C + c;
-        *out_btc = *wte_ix + *wpe_tc;
-    }
-}
-
 // really bad naive kernel with atomicAdd
 __global__ void encoder_backward_kernel(float* dwte, float* dwpe,
                                         const float* dout, const int* inp,
@@ -193,8 +181,11 @@ __global__ void encoder_backward_kernel(float* dwte, float* dwpe,
         float* dwte_ix = dwte + ix * C + c;
         float* dwpe_tc = dwpe + t * C + c;
 
-        atomicAdd(dwte_ix, *dout_btc);
-        atomicAdd(dwpe_tc, *dout_btc);
+        cuda::atomic_ref<float, cuda::thread_scope_device> dwte_ix_ref(*dwte_ix);
+        cuda::atomic_ref<float, cuda::thread_scope_device> dwte_tc_ref(*dwpe_tc);
+
+        dwte_ix_ref.fetch_add(*dout_btc, cuda::memory_order_relaxed);
+        dwte_tc_ref.fetch_add(*dout_btc, cuda::memory_order_relaxed);
     }
 }
 
@@ -384,23 +375,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     }
 }
 
-__global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
-    }
-}
-
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float xi = inp[i];
-        float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
-    }
-}
-
 __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float* dout, const int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
@@ -416,6 +391,10 @@ __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float*
 }
 
 __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel4, but optimised for very large Cs with advanced unrolling
 
@@ -429,10 +408,10 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     const int warpsPerBlock = blockDim.x / 32;
 
     extern __shared__ float shared[];
-    int idx = blockIdx.x;
-    int tid = threadIdx.x;
-    int warpId = threadIdx.x / 32; // warp index within a block
-    int laneId = threadIdx.x % 32; // thread index within a warp
+    int idx = cg::this_grid().block_rank();
+    int tid = block.thread_rank();
+    int warpId = warp.meta_group_rank(); // warp index within a block
+    int laneId = warp.thread_rank(); // thread index within a warp
 
     // shared[] must be allocated to have 2 * warpsPerBlock elements
     // first half for max values, the second half for sum values
@@ -453,12 +432,12 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
         #pragma unroll
         for (int u = 0; u < UNROLL_FACTOR; u++) {
-            maxval = fmaxf(maxval, x[min(C - 1, i + u*blockDim.x)]);
+            maxval = fmaxf(maxval, x[min(C - 1, i + u * block.size())]);
         }
     }
 
     // now within-warp reductions for maxval
-    maxval = warpReduceMax(maxval);
+    maxval = cg::reduce(warp, maxval, cg::greater<float>{});
     // the 0th thread of each warp writes the maxval of that warp to shared memory
     if (laneId == 0) maxvals[warpId] = maxval;
     __syncthreads();
@@ -479,17 +458,17 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     // compute expf and write the result to global memory
     // + thread coarsening for sum
     float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+    for (int i = tid; i < C; i += block.size() * UNROLL_FACTOR) {
         float reg_array[UNROLL_FACTOR];
         #pragma unroll
         for (int u = 0; u < UNROLL_FACTOR; u++) {
-            reg_array[u] = __ldcs(&x[min(C - 1, i + u*blockDim.x)]);
+            reg_array[u] = __ldcs(&x[min(C - 1, i + u * block.size())]);
         }
         #pragma unroll
         for (int u = 0; u < UNROLL_FACTOR; u++) {
-            if (i + u*blockDim.x < C) {
+            if (i + u * block.size() < C) {
                 float output = expf(reg_array[u] - offset);
-                y[min(C - 1, i + u*blockDim.x)] = output; // compiler likes redundant min()?!
+                y[min(C - 1, i + u * block.size())] = output; // compiler likes redundant min()?!
                 sumval += output; // combined into the same loop unlike kernel3
             }
         }
@@ -499,7 +478,8 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     // step 2: sum all the values and divide by the sum
 
     // within-warp reduction for sumval
-    sumval = warpReduceSum(sumval);
+    sumval = cg::reduce(warp, sumval, cg::plus<float>{});
+
     // write sumval to shared memory
     if (laneId == 0) sumvals[warpId] = sumval;
     __syncthreads();
@@ -517,16 +497,16 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     float sum = sumvals[0];
 
     // divide the whole row by the sum
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+    for (int i = tid; i < C; i += block.size() * UNROLL_FACTOR) {
         float reg_array[UNROLL_FACTOR];
         #pragma unroll
         for (int u = 0; u < UNROLL_FACTOR; u++) {
-            reg_array[u] = y[min(C - 1, i + u*blockDim.x)];
+            reg_array[u] = y[min(C - 1, i + u * block.size())];
         }
         #pragma unroll
         for (int u = 0; u < UNROLL_FACTOR; u++) {
-            if (i + u*blockDim.x < C) {
-                y[i + u*blockDim.x] = reg_array[u] / sum;
+            if (i + u * block.size() < C) {
+                y[i + u * block.size()] = reg_array[u] / sum;
             }
         }
     }
@@ -596,10 +576,16 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
+
+        cuda::atomic_ref<float, cuda::thread_scope_device> dbias_ref(dbias[i]);
+        cuda::atomic_ref<float, cuda::thread_scope_device> dweight_ref(dweight[i]);
+
         // gradient contribution to bias
-        atomicAdd(&dbias[i], dout_bt[i]);
+        dbias_ref.fetch_add(dout_bt[i], cuda::memory_order_relaxed);
+
         // gradient contribution to weight
-        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
+        dweight_ref.fetch_add(norm_bti * dout_bt[i], cuda::memory_order_relaxed);
+
         // gradient contribution to input
         float dval = 0.0f;
         dval += dnorm_i; // term 1
@@ -657,7 +643,7 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
-__device__ inline float lerp(float start, float end, float weight) {
+__device__ inline float lerp_(float start, float end, float weight) {
     return fma(weight, end, fma(-weight, start, start));
 }
 
@@ -669,10 +655,10 @@ __global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* 
    float m = m_memory[i];
    float v = v_memory[i];
    // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
+   m = lerp_(grad, m, beta1);
    m_memory[i] = m;
    // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
+   v = lerp_(grad * grad, v, beta2);
    v_memory[i] = v;
    m /= beta1_correction;  // m_hat
    v /= beta2_correction;  // v_hat
@@ -776,14 +762,40 @@ __global__ void fused_classifier_kernel3(float* logits, float* losses, float* pr
 // ----------------------------------------------------------------------------
 // kernel launchers
 
+__device__ cuda::std::pair<int, int> i2n(int idx, int E1) {
+    return {idx / E1, idx % E1};
+}
+
+__device__ cuda::std::tuple<int, int, int> i2n(int idx, int E1, int E2) {
+    int bt = idx / E1;
+    int b = bt / E2;
+    int t = bt % E2;
+    int c = idx % E1;
+    return {b, t, c};
+}
+
+__host__ __device__ cuda::std::tuple<int, int, int, int> i2n(int idx, int E1, int E2, int E3) {
+    int b = idx / (E1 * E2 * E3);
+    int rest = idx % (E1 * E2 * E3);
+    int nh_ = rest / (E2 * E3);
+    rest = rest % (E2 * E3);
+    int t = rest / E3;
+    int hs = rest % E3;
+    return {b, t, nh_, hs};
+}
+
 void encoder_forward(float* out,
-                     int* inp, float* wte, float* wpe,
-                     int B, int T, int C) {
-    const int N = B * T * C;
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    encoder_forward_kernel2<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
-    cudaCheck(cudaGetLastError());
+                     const thrust::device_vector<int>& inpv, float* wte, float* wpe,
+                     int B, int T, int C, int V) {
+    cuda::std::mdspan<float, cuda::std::dextents<int, 3>> out_md(out, B, T, C);
+    cuda::std::mdspan<float, cuda::std::dextents<int, 2>> wte_md(wte, V, C);
+    cuda::std::mdspan<float, cuda::std::dextents<int, 2>> wpe_md(wpe, T, C);
+    cuda::std::mdspan<const int, cuda::std::dextents<int, 2>> inp_md(thrust::raw_pointer_cast(inpv.data()), B, T);
+
+    cudaCheck(cub::DeviceFor::Bulk(B * T * C, [=] __device__(int idx) {
+      auto [b, t, c] = i2n(idx, C, T);
+      out_md(b, t, c) = wte_md(inp_md(b, t), c) + wpe_md(t, c);
+    }));
 }
 
 void encoder_backward(float* dwte, float* dwpe,
@@ -886,6 +898,23 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
+template <class T> struct streaming_accessor {
+    using offset_policy = streaming_accessor;
+    using element_type = T;
+    using data_handle_type = const T *;
+    using reference = const T;
+
+    inline __host__ __device__ 
+    reference access(data_handle_type p, size_t i) const {
+        NV_IF_TARGET(NV_IS_DEVICE, (return __ldcs(p + i);), (return p[i];));
+    }
+
+    inline __host__ __device__ 
+    data_handle_type offset(data_handle_type p, size_t i) const {
+        return p + i;
+    }
+};
+
 void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
                         float* inp,
                         int B, int T, int C, int NH) {
@@ -902,10 +931,23 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
-    int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
-    cudaCheck(cudaGetLastError());
+
+    constexpr auto dyn = cuda::std::dynamic_extent;
+    using ext_t = cuda::std::extents<int, dyn, dyn, 3, dyn, dyn>;
+    using mds_t = cuda::std::mdspan<const float, ext_t, cuda::std::layout_right, streaming_accessor<float>>;
+
+    ext_t extents{B, T, NH, HS};
+    mds_t inp_md{inp, extents};
+
+    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
+    thrust::for_each(thrust::cuda::par_nosync, thrust::make_counting_iterator(0),
+                     thrust::make_counting_iterator(B * NH * T * HS),
+                     [=] __device__(int idx) {
+                        auto [b, t, nh_, hs] = i2n(idx, NH, T, HS);
+                        q[idx] = inp_md(b, t, 0, nh_, hs);
+                        k[idx] = inp_md(b, t, 1, nh_, hs);
+                        v[idx] = inp_md(b, t, 2, nh_, hs);
+                     });
 
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
@@ -924,23 +966,27 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
-    cudaCheck(cudaGetLastError());
+
+    auto map = thrust::make_transform_iterator(
+        thrust::make_counting_iterator(0), [=] __host__ __device__(int idx) {
+          auto [b, n, nh_, d_] = i2n(idx, NH, T, HS);
+          return (b * NH * T * HS) + (n * NH * HS) + (nh_ * HS) + d_;
+        });
+    cub::CacheModifiedInputIterator<cub::LOAD_CS, float> vaccumcs(vaccum);
+    thrust::scatter(thrust::cuda::par_nosync, vaccumcs, vaccumcs + B * T * C, map, out);
 }
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
-    cudaCheck(cudaGetLastError());
+    cub::CacheModifiedInputIterator<cub::LOAD_CS, float> inp1cs(inp1);
+    cub::CacheModifiedInputIterator<cub::LOAD_CS, float> inp2cs(inp2);
+    thrust::transform(thrust::cuda::par_nosync, inp1cs, inp1cs + N, inp2cs, out, thrust::plus<float>());
 }
 
 void gelu_forward(float* out, const float* inp, int N) {
-    const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
-    cudaCheck(cudaGetLastError());
+    thrust::transform(thrust::cuda::par_nosync, inp, inp + N, out, [] __device__(float xi) {
+        float cube = 0.044715f * xi * xi * xi;
+        return 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+    });
 }
 
 void gelu_backward(float* dinp, const float* inp, const float* dout, const int N) {
@@ -1096,27 +1142,20 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, int on_device) {
-    // on_device: 0 = CPU, 1 = GPU
+thrust::device_vector<float> malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     // calculate the number of parameters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
     }
-    // malloc all parameters all at once on the device
-    float* params_memory;
-    if (on_device) {
-        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
-    } else {
-        params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
-    }
+    thrust::device_vector<float> params_memory(num_parameters);
     // assign all the tensors their place in the array
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
-    float* params_memory_iterator = params_memory;
+    float* params_memory_iterator = thrust::raw_pointer_cast(params_memory.data());
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         *(ptrs[i]) = params_memory_iterator;
         params_memory_iterator += param_sizes[i];
@@ -1187,13 +1226,12 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[24] = B * T * C; // v_accum
 }
 
-float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
+thrust::device_vector<float> malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
     }
-    float* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+    thrust::device_vector<float> acts_memory(num_activations);
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
@@ -1201,7 +1239,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses,
         &acts->qkvr, &acts->v_accum
     };
-    float* acts_memory_iterator = acts_memory;
+    float* acts_memory_iterator = thrust::raw_pointer_cast(acts_memory.data());
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         *(ptrs[i]) = acts_memory_iterator;
         acts_memory_iterator += act_sizes[i];
@@ -1209,53 +1247,53 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
     return acts_memory;
 }
 
-typedef struct {
+struct GPT2 {
     GPT2Config config;
     // the weights of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
-    float* params_memory;
+    thrust::device_vector<float> params_memory;
     size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
-    float* grads_memory;
-    // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
+    thrust::device_vector<float> grads_memory;
+    thrust::device_vector<float> m_memory;
+    thrust::device_vector<float> v_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
-    float* acts_memory;
+    thrust::device_vector<float> acts_memory;
     size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
     size_t num_grad_acts;
-    float* grads_acts_memory;
+    thrust::device_vector<float> grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
-    int* inputs; // the input tokens for the current forward pass
-    int* targets; // the target tokens for the current forward pass
+    thrust::device_vector<int> inputs; // the input tokens for the current forward pass
+    thrust::device_vector<int> targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
-    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-} GPT2;
+    pinned_vector<float> cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+};
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+
+void gpt2_build_from_checkpoint(GPT2 &model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
-    freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
+    fread(model_header, sizeof(int), 256, model_file);
+    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
+    if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
 
     // read in hyperparameters
     int maxT, V, L, NH, C;
-    model->config.max_seq_len = maxT = model_header[2];
-    model->config.vocab_size = V = model_header[3];
-    model->config.num_layers = L = model_header[4];
-    model->config.num_heads = NH = model_header[5];
-    model->config.channels = C = model_header[6];
+    model.config.max_seq_len = maxT = model_header[2];
+    model.config.vocab_size = V = model_header[3];
+    model.config.num_layers = L = model_header[4];
+    model.config.num_heads = NH = model_header[5];
+    model.config.channels = C = model_header[6];
     printf("[GPT-2]\n");
     printf("max_seq_len: %d\n", maxT);
     printf("vocab_size: %d\n", V);
@@ -1264,55 +1302,46 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_sizes, model->config);
+    fill_in_parameter_sizes(model.param_sizes, model.config);
 
     // count the number of parameters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += model->param_sizes[i];
+        num_parameters += model.param_sizes[i];
     }
     printf("num_parameters: %zu\n", num_parameters);
-    model->num_parameters = num_parameters;
+    model.num_parameters = num_parameters;
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
+    model.params_memory = malloc_and_point_parameters(&model.params, model.param_sizes);
     printf("allocated %d MiB for model parameters\n", (int)round(num_parameters * sizeof(float) / (1024 * 1024)));
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
-    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    free(params_memory_cpu);
-    fcloseCheck(model_file);
+    thrust::host_vector<float> params_memory_cpu(num_parameters);
+    fread(thrust::raw_pointer_cast(params_memory_cpu.data()), sizeof(float), num_parameters, model_file);
+    model.params_memory = params_memory_cpu;
+    fclose(model_file);
 
     // other inits
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model.batch_size = 0;
+    model.seq_len = 0;
+    model.mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 &model, int* inputs, int* targets, int B, int T) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
-    if (model->params_memory == NULL) {
+    if (model.params_memory.empty()) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
     }
 
     // convenience parameters
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    int V = model.config.vocab_size;
+    int L = model.config.num_layers;
+    int NH = model.config.num_heads;
+    int C = model.config.channels;
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
@@ -1323,43 +1352,44 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // allocate space for all the activations if needed (done here, lazily)
-    if(model->acts_memory == NULL) {
+    if(model.acts_memory.empty()) {
         // record the current B,T as well
-        model->batch_size = B;
-        model->seq_len = T;
+        model.batch_size = B;
+        model.seq_len = T;
         // and now allocate the space
-        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        fill_in_activation_sizes(model.act_sizes, B, T, model.config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            num_activations += model->act_sizes[i];
+            num_activations += model.act_sizes[i];
         }
-        model->num_activations = num_activations;
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        printf("num_activations: %zu\n", num_activations);
+        model.num_activations = num_activations;
+        model.acts_memory = malloc_and_point_activations(&model.acts, model.act_sizes);
         printf("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(float) / (1024 * 1024)));
         // also create memory for caching inputs and targets
-        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
-        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
-        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+        model.inputs.resize(B * T);
+        model.targets.resize(B * T);
+        model.cpu_losses.resize(B * T);
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+        if (B != model.batch_size || T != model.seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model.batch_size, model.seq_len, B, T);
             exit(EXIT_FAILURE);
         }
     }
 
     // copy inputs/targets to the model
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    thrust::copy_n(inputs, B * T, model.inputs.begin());
     if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+        thrust::copy_n(targets, B * T, model.targets.begin());
     }
 
     // forward pass
-    ParameterTensors params = model->params; // for brevity
-    ActivationTensors acts = model->acts;
+    ParameterTensors params = model.params; // for brevity
+    ActivationTensors acts = model.acts;
     float* residual;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model.inputs, params.wte, params.wpe, B, T, C, V); // encoding goes into residual[0]
 
     for (int l = 0; l < L; l++) {
 
@@ -1422,46 +1452,47 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.logits, acts.losses, NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.logits, acts.losses, NULL, thrust::raw_pointer_cast(model.targets.data()), B, T, V, V); 
+
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
-        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        thrust::copy_n(thrust::device_pointer_cast(acts.losses), B * T, model.cpu_losses.begin());
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
+        for (int i=0; i<B*T; i++) { mean_loss += model.cpu_losses[i]; }
         mean_loss /= B*T;
-        model->mean_loss = mean_loss;
+        model.mean_loss = mean_loss;
 
     } else {
         // if we don't have targets, we don't have loss
         softmax_forward(acts.probs, acts.logits, B*T, V);
-        model->mean_loss = -1.0f;
+        model.mean_loss = -1.0f;
     }
 }
 
-void gpt2_zero_grad(GPT2 *model) {
-    if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_grad_acts * sizeof(float))); }
-    if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
+void gpt2_zero_grad(GPT2 &model) {
+    thrust::fill(thrust::cuda::par_nosync, model.grads_acts_memory.begin(), model.grads_acts_memory.end(), 0.0f);
+    thrust::fill(thrust::cuda::par_nosync,model.grads_memory.begin(), model.grads_memory.end(), 0.0f);
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 &model) {
 
     // double check we forwarded previously, with targets
-    if (model->mean_loss == -1.0f) {
+    if (model.mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
         exit(EXIT_FAILURE);
     }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
-    if (model->grads_memory == NULL) {
+    if (model.grads_memory.empty()) {
         // allocate buffers for weight gradients
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
-        printf("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
+        model.grads_memory = malloc_and_point_parameters(&model.grads, model.param_sizes);
+        printf("allocated %d MiB for parameter gradients\n", (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass acrtivations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
-        GPT2Config cfg = model->config;
+        GPT2Config cfg = model.config;
         cfg.num_layers = 1; // copy the configuration but override number of layers to 1
-        fill_in_activation_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
+        fill_in_activation_sizes(bw_act_sizes, model.batch_size, model.seq_len, cfg);
         // on top of that, some buffers are not needed at all, set their sizes to zero
         bw_act_sizes[0] = 0; // encoded
         bw_act_sizes[2] = 0; // ln1_mean
@@ -1474,29 +1505,29 @@ void gpt2_backward(GPT2 *model) {
         bw_act_sizes[19] = 0; // lnf_rstd
         bw_act_sizes[21] = 0; // probs
         // count up and allocate the space
-        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
-        model->num_grad_acts = 0;
+        model.grads_acts_memory = malloc_and_point_activations(&model.grads_acts, bw_act_sizes);
+        model.num_grad_acts = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            model->num_grad_acts += bw_act_sizes[i];
+            model.num_grad_acts += bw_act_sizes[i];
         }
-        printf("allocated %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(float) / (1024 * 1024)));
+        printf("allocated %d MiB for activation gradients\n", (int)round(model.num_grad_acts * sizeof(float) / (1024 * 1024)));
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
     }
 
     // convenience shortcuts
-    int B = model->batch_size;
-    int T = model->seq_len;
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    int B = model.batch_size;
+    int T = model.seq_len;
+    int V = model.config.vocab_size;
+    int L = model.config.num_layers;
+    int NH = model.config.num_heads;
+    int C = model.config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
-    ParameterTensors params = model->params; // for brevity
-    ParameterTensors grads = model->grads;
-    ActivationTensors acts = model->acts;
-    ActivationTensors grads_acts = model->grads_acts;
+    ParameterTensors params = model.params; // for brevity
+    ParameterTensors grads = model.grads;
+    ActivationTensors acts = model.acts;
+    ActivationTensors grads_acts = model.grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
@@ -1573,18 +1604,16 @@ void gpt2_backward(GPT2 *model) {
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+    encoder_backward(grads.wte, grads.wpe, dresidual, thrust::raw_pointer_cast(model.inputs.data()), B, T, C);
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
     // lazily allocate the memory for m_memory and v_memory
-    if (model->m_memory == NULL) {
-        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
+    if (model->m_memory.empty()) {
+        model->m_memory = thrust::device_vector<float>(model->num_parameters, 0.0f);
+        model->v_memory = thrust::device_vector<float>(model->num_parameters, 0.0f);
         printf("allocated %d MiB for AdamW optimizer state m\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
         printf("allocated %d MiB for AdamW optimizer state v\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
     }
@@ -1593,22 +1622,14 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    adamw_kernel2<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
-                                              model->num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    adamw_kernel2<<<num_blocks, block_size>>>(
+        thrust::raw_pointer_cast(model->params_memory.data()), 
+        thrust::raw_pointer_cast(model->grads_memory.data()), 
+        thrust::raw_pointer_cast(model->m_memory.data()), 
+        thrust::raw_pointer_cast(model->v_memory.data()),
+        model->num_parameters,
+        learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     cudaCheck(cudaGetLastError());
-}
-
-void gpt2_free(GPT2 *model) {
-    cudaCheck(cudaFree(model->params_memory));
-    cudaCheck(cudaFree(model->grads_memory));
-    cudaCheck(cudaFree(model->m_memory));
-    cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->acts_memory));
-    cudaCheck(cudaFree(model->grads_acts_memory));
-    cudaCheck(cudaFree(model->inputs));
-    cudaCheck(cudaFree(model->targets));
-    cudaFreeHost(model->cpu_losses);
 }
 
 #ifndef TESTING
@@ -1617,7 +1638,7 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // data loader lite: returns random batches of data from a file of integers
 
-typedef struct {
+struct DataLoader {
     // hyperparameters
     int B;
     int T;
@@ -1626,12 +1647,17 @@ typedef struct {
     long file_size;
     long current_position;
     // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
+    pinned_vector<int> batch;
+    int* inputs() {
+        return thrust::raw_pointer_cast(batch.data());
+    }
+    int* targets() {
+        // targets are shifted by one
+        return inputs() + 1;
+    }
     // convenience variables
     int num_batches;
-} DataLoader;
+};
 
 void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->B = B;
@@ -1653,9 +1679,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     // allocate space for B*T + 1 integers to store the inputs and targets
     // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
     // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
+    loader->batch.resize(B * T + 1);
     loader->num_batches = loader->file_size / (B * T * sizeof(int));
 }
 
@@ -1672,14 +1696,13 @@ void dataloader_next_batch(DataLoader *loader) {
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    fread(thrust::raw_pointer_cast(loader->batch.data()), sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    cudaFreeHost(loader->batch);
+    fclose(loader->tokens_file);
 }
 
 // ----------------------------------------------------------------------------
@@ -1698,7 +1721,7 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-int sample_mult(float* probabilities, int n, float coin) {
+int sample_mult(const thrust::host_vector<float> &probabilities, int n, float coin) {
     // sample index from probabilities (they must sum to 1!)
     // coin is a random number in [0, 1), usually from random_f32()
     float cdf = 0.0f;
@@ -1900,11 +1923,13 @@ int main(int argc, char *argv[]) {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    // setup the (global) cuBLASLt workspace
+    thrust::device_vector<std::uint8_t> cublaslt_workspace_vec(cublaslt_workspace_size);
+    cublaslt_workspace = thrust::raw_pointer_cast(cublaslt_workspace_vec.data());
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     char train_tokens_filename[128];
@@ -1933,8 +1958,9 @@ int main(int argc, char *argv[]) {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+
+    std::unique_ptr<int[]> gen_tokens(new int[B * T]);
+    thrust::host_vector<float> cpu_probs(model.config.vocab_size);
 
     // train
     struct timespec start, end;
@@ -1948,7 +1974,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_forward(model, val_loader.inputs(), val_loader.targets(), B, T);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1969,14 +1995,14 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(model, gen_tokens.get(), NULL, B, T);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
                 // move probs back to CPU and sample
-                cudaCheck(cudaMemcpy(cpu_probs, probs, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+                thrust::copy_n(thrust::device_pointer_cast(probs), model.config.vocab_size, cpu_probs.begin());
                 float coin = random_f32(&rng_state);
                 int next_token = sample_mult(cpu_probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
@@ -2000,15 +2026,15 @@ int main(int argc, char *argv[]) {
         if (last_step) { break; }
 
         // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
+        auto start = std::chrono::steady_clock::now();
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        gpt2_forward(model, train_loader.inputs(), train_loader.targets(), B, T);
+        gpt2_zero_grad(model);
+        gpt2_backward(model);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        auto end = std::chrono::steady_clock::now();
+        double time_elapsed_s = std::chrono::duration<double>(end - start).count();
         total_sum_iteration_time_s += time_elapsed_s;
         printf("step %d/%d: train loss %f (%f ms)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000);
         logger_log_train(&logger, step, model.mean_loss);
@@ -2020,10 +2046,6 @@ int main(int argc, char *argv[]) {
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
-    gpt2_free(&model);
-    free(cpu_probs);
-    free(gen_tokens);
-    cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     logger_free(&logger);
