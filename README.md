@@ -1,6 +1,7 @@
 > **Note**
 > This is an unmaintained fork of https://github.com/karpathy/llm.c that updates the CUDA implementation to demonstrate features and best practices of the [CUDA C++ Core Libraries](https://github.com/NVIDIA/cccl).
 > This work was presented as a lecture to the [CUDA MODE](https://github.com/cuda-mode) group.
+> You can see the full set of changes [here](https://github.com/karpathy/llm.c/compare/master...gevtushenko:llm.c:backprop). 
 > The recording is available on [YouTube](https://www.youtube.com/watch?v=WiB_3Csfj_Q).
 > The slides are available [here](https://drive.google.com/drive/folders/1T-t0d_u0Xu8w_-1E5kAwmXNfF72x-HTA).
 > This fork is primarily for demonstration purposes only and there are currently no plans to keep this fork up-to-date with the upstream llm.c project.
